@@ -1,153 +1,101 @@
 import ch.bildspur.artnet.*;
 
 /*
- * ArtNetDevice — Sends LED data to a PrimusV2 (or V1) receiver.
+ * ArtNetDevice — Sends LED data to a PrimusV2 receiver.
  *
- * Supports two modes controlled by the 'useV2Protocol' flag:
- *   V1 (legacy):  All data packed into a single universe 0.
- *   V2 (new):     Grid → universe 0, Strip → universe 1.
- *                  Each universe: [brightness][R][G][B]...
+ * Supports 3 output universes matching the hardware strip layout:
+ *   Universe 0 → Strip A0 (Grid 8×4, 32 RGB LEDs)
+ *   Universe 1 → Strip A1 (68 RGB LEDs)
+ *   Universe 2 → Strip A2 (72 RGB LEDs)
  *
- * V2 mode matches the PrimusV2 receiver where each physical output
- * listens on its own ArtNet universe.
+ * Each universe byte layout: [brightness][R][G][B]...
  */
 
 class ArtNetDevice {
   ArtNetClient artnet;
   String deviceIP;
   boolean connected = false;
-  boolean useV2Protocol = false; // false = V1 legacy, true = V2 multi-universe
 
-  // V1 legacy: single combined buffer for universe 0
-  byte[] combinedData;
-  int v1Universe = 0;
-
-  // V2: separate buffers per universe
-  byte[] gridData;   // universe 0: [brightness][RGB...]
-  byte[] stripData;  // universe 1: [brightness][RGB...]
-  int gridUniverse  = 0;
-  int stripUniverse = 1;
+  int numOutputs;
+  int[] ledCounts;
+  byte[][] outputData;  // per-universe buffers
 
   byte brightnessValue = 50;
 
-  // Track LED counts for blackout sizing
-  int gridLEDCount;
-  int stripLEDCount;
-
-  ArtNetDevice(int universe, String deviceIP, int totalLEDs) {
-    this(universe, deviceIP, totalLEDs, false);
-  }
-
-  ArtNetDevice(int universe, String deviceIP, int totalLEDs, boolean v2Mode) {
+  ArtNetDevice(String deviceIP, int[] ledCounts) {
     this.deviceIP = deviceIP;
-    this.v1Universe = universe;
-    this.useV2Protocol = v2Mode;
+    this.numOutputs = ledCounts.length;
+    this.ledCounts = ledCounts;
 
-    // Calculate grid count (always 32 = 8×4) and strip count
-    this.gridLEDCount = 32;
-    this.stripLEDCount = totalLEDs - gridLEDCount;
-
-    // V1 legacy buffer
-    combinedData = new byte[1 + totalLEDs * 3];
-    combinedData[0] = brightnessValue;
-
-    // V2 per-universe buffers
-    gridData  = new byte[1 + gridLEDCount * 3];
-    stripData = new byte[1 + max(stripLEDCount, 0) * 3];
-    gridData[0]  = brightnessValue;
-    stripData[0] = brightnessValue;
+    // Allocate per-universe buffers: [brightness] + [RGB per pixel]
+    outputData = new byte[numOutputs][];
+    for (int i = 0; i < numOutputs; i++) {
+      outputData[i] = new byte[1 + ledCounts[i] * 3];
+      outputData[i][0] = brightnessValue;
+    }
 
     try {
       artnet = new ArtNetClient(null);
       artnet.start();
       connected = true;
-      println("ArtNet initialized → " + deviceIP + (v2Mode ? " [V2 multi-universe]" : " [V1 legacy]"));
+      println("ArtNet initialized → " + deviceIP + " [3 universes]");
     } catch (Exception e) {
       println("Error initializing ArtNet: " + e.getMessage());
       connected = false;
     }
   }
 
-  void updateData(LED[][] gridLEDs, LED[] stripLEDs, int brightness) {
+  void updateData(LED[][] gridLEDs, LED[] strip1LEDs, LED[] strip2LEDs, int brightness) {
     brightnessValue = (byte)brightness;
 
-    if (useV2Protocol) {
-      updateDataV2(gridLEDs, stripLEDs, brightness);
-    } else {
-      updateDataV1(gridLEDs, stripLEDs, brightness);
-    }
-  }
-
-  // V1 legacy: everything in one buffer, one universe
-  private void updateDataV1(LED[][] gridLEDs, LED[] stripLEDs, int brightness) {
-    combinedData[0] = (byte)brightness;
-    int index = 1;
-
-    for (int y = 0; y < gridLEDs.length; y++) {
-      for (int x = 0; x < gridLEDs[y].length; x++) {
-        color c = gridLEDs[y][x].currentColor;
-        combinedData[index++] = (byte)((c >> 16) & 0xFF);
-        combinedData[index++] = (byte)((c >> 8) & 0xFF);
-        combinedData[index++] = (byte)(c & 0xFF);
-      }
-    }
-
-    for (int i = 0; i < stripLEDs.length; i++) {
-      color c = stripLEDs[i].currentColor;
-      combinedData[index++] = (byte)((c >> 16) & 0xFF);
-      combinedData[index++] = (byte)((c >> 8) & 0xFF);
-      combinedData[index++] = (byte)(c & 0xFF);
-    }
-  }
-
-  // V2: grid → universe 0, strip → universe 1
-  private void updateDataV2(LED[][] gridLEDs, LED[] stripLEDs, int brightness) {
-    // Grid buffer
-    gridData[0] = (byte)brightness;
+    // Universe 0: Grid (A0, 32 LEDs)
+    outputData[0][0] = (byte)brightness;
     int idx = 1;
     for (int y = 0; y < gridLEDs.length; y++) {
       for (int x = 0; x < gridLEDs[y].length; x++) {
         color c = gridLEDs[y][x].currentColor;
-        gridData[idx++] = (byte)((c >> 16) & 0xFF);
-        gridData[idx++] = (byte)((c >> 8) & 0xFF);
-        gridData[idx++] = (byte)(c & 0xFF);
+        outputData[0][idx++] = (byte)((c >> 16) & 0xFF);
+        outputData[0][idx++] = (byte)((c >> 8) & 0xFF);
+        outputData[0][idx++] = (byte)(c & 0xFF);
       }
     }
 
-    // Strip buffer
-    stripData[0] = (byte)brightness;
+    // Universe 1: Strip A1 (68 LEDs)
+    outputData[1][0] = (byte)brightness;
     idx = 1;
-    for (int i = 0; i < stripLEDs.length; i++) {
-      color c = stripLEDs[i].currentColor;
-      stripData[idx++] = (byte)((c >> 16) & 0xFF);
-      stripData[idx++] = (byte)((c >> 8) & 0xFF);
-      stripData[idx++] = (byte)(c & 0xFF);
+    for (int i = 0; i < strip1LEDs.length; i++) {
+      color c = strip1LEDs[i].currentColor;
+      outputData[1][idx++] = (byte)((c >> 16) & 0xFF);
+      outputData[1][idx++] = (byte)((c >> 8) & 0xFF);
+      outputData[1][idx++] = (byte)(c & 0xFF);
+    }
+
+    // Universe 2: Strip A2 (72 LEDs)
+    outputData[2][0] = (byte)brightness;
+    idx = 1;
+    for (int i = 0; i < strip2LEDs.length; i++) {
+      color c = strip2LEDs[i].currentColor;
+      outputData[2][idx++] = (byte)((c >> 16) & 0xFF);
+      outputData[2][idx++] = (byte)((c >> 8) & 0xFF);
+      outputData[2][idx++] = (byte)(c & 0xFF);
     }
   }
 
   void sendBlackout(int brightness) {
     if (!connected) return;
     try {
-      if (useV2Protocol) {
-        byte[] gridBlack  = new byte[1 + gridLEDCount * 3];
-        byte[] stripBlack = new byte[1 + max(stripLEDCount, 0) * 3];
-        gridBlack[0]  = (byte)brightness;
-        stripBlack[0] = (byte)brightness;
-
-        artnet.unicastDmx(deviceIP, gridUniverse, 0, gridBlack);
-        artnet.unicastDmx(deviceIP, stripUniverse, 0, stripBlack);
-        delay(50);
-        artnet.unicastDmx(deviceIP, gridUniverse, 0, gridBlack);
-        artnet.unicastDmx(deviceIP, stripUniverse, 0, stripBlack);
-        println("Sent V2 blackout on universes " + gridUniverse + " & " + stripUniverse);
-      } else {
-        byte[] blackoutData = new byte[combinedData.length];
-        blackoutData[0] = (byte)brightness;
-        artnet.unicastDmx(deviceIP, v1Universe, 0, blackoutData);
-        delay(50);
-        artnet.unicastDmx(deviceIP, v1Universe, 0, blackoutData);
-        println("Sent V1 blackout on universe " + v1Universe);
+      for (int i = 0; i < numOutputs; i++) {
+        byte[] blackout = new byte[outputData[i].length];
+        blackout[0] = (byte)brightness;
+        artnet.unicastDmx(deviceIP, i, 0, blackout);
       }
+      delay(50);
+      for (int i = 0; i < numOutputs; i++) {
+        byte[] blackout = new byte[outputData[i].length];
+        blackout[0] = (byte)brightness;
+        artnet.unicastDmx(deviceIP, i, 0, blackout);
+      }
+      println("Sent blackout on universes 0, 1, 2");
     } catch (Exception e) {
       println("Error sending blackout: " + e.getMessage());
       connected = false;
@@ -157,11 +105,8 @@ class ArtNetDevice {
   void sendData() {
     if (!connected) return;
     try {
-      if (useV2Protocol) {
-        artnet.unicastDmx(deviceIP, gridUniverse, 0, gridData);
-        artnet.unicastDmx(deviceIP, stripUniverse, 0, stripData);
-      } else {
-        artnet.unicastDmx(deviceIP, v1Universe, 0, combinedData);
+      for (int i = 0; i < numOutputs; i++) {
+        artnet.unicastDmx(deviceIP, i, 0, outputData[i]);
       }
     } catch (Exception e) {
       println("Error sending ArtNet data: " + e.getMessage());

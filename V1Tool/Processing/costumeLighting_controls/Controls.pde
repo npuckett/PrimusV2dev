@@ -8,23 +8,21 @@ void setupControls() {
   // Calculate total height needed for LEDs to position controls below
   float ledsHeight = ledGrid.yPos + ledGrid.height + 10;
   
-  // Add space for the LED strip (account for multiple rows)
-  int maxLedsPerRow = (int) Math.floor((windowWidth - 100) / (ledStrip.ledSize + ledStrip.spacing));
-  int rowCount = (int) Math.ceil((float)stripCount / maxLedsPerRow);
-  float stripHeight = rowCount * (ledStrip.ledSize + ledStrip.spacing) + 10;
+  // Account for two strip rows (A1 + A2)
+  float strip2Bottom = ledStrip2.yPos + ledStrip2.getHeight();
   
-  // Position brightness slider centered under the strip with more space
-  setupBrightnessSlider(ledStrip.yPos + stripHeight + 20);
+  // Position brightness slider centered under the strips with more space
+  setupBrightnessSlider(strip2Bottom + 20);
   
-  // Position controls directly after the brightness slider - with MORE space
-  float controlsY = ledStrip.yPos + stripHeight + 100; // Increased spacing
+  // Position controls directly after the brightness slider
+  float controlsY = strip2Bottom + 100;
   
   // Create groups for grid and strip controls with proper spacing
   setupGridControlGroup(controlsY);
   setupStripControlGroup(controlsY);
   
-  // Create debug group at the bottom - with more space and collapsible
-  setupDebugGroup(controlsY + 450); // Moved further down
+  // Create debug group at the bottom
+  setupDebugGroup(controlsY + 450);
 }
 
 void setupNetworkControlGroup(float yPos) {
@@ -82,27 +80,12 @@ void setupNetworkControlGroup(float yPos) {
      .setGroup(networkGroup)
      ;
   
-  // Controller IP address display - now with larger text
+  // Controller IP address display
   cp5.addTextlabel("hostIPDisplay")
-     .setPosition(720, 50) // Shifted right to make room for device profile dropdown
+     .setPosition(580, 50)
      .setFont(createFont("Arial Bold", 14))
      .setText("HOST: " + getHostIP())
      .setColorValue(color(0))
-     .setGroup(networkGroup)
-     ;
-
-  // Device profile toggle — V1 (single universe) vs V2 (multi-universe)
-  cp5.addScrollableList("deviceProfile")
-     .setPosition(580, 40)
-     .setSize(120, 60)
-     .setBarHeight(25)
-     .setItemHeight(25)
-     .addItems(java.util.Arrays.asList("V1 Legacy", "V2 Multi-Uni"))
-     .setValue(0) // Default to V1 legacy for backward compatibility
-     .setLabel("DEVICE")
-     .setColorBackground(color(60, 80, 60))
-     .setColorForeground(color(70, 90, 70))
-     .setColorActive(color(80, 100, 80))
      .setGroup(networkGroup)
      ;
 }
@@ -135,7 +118,7 @@ void setupGridControlGroup(float yPos) {
   int groupWidth = (windowWidth - 40) / 2 - 10;
   
   // Create a group for grid controls - matching screenshot style
-  Group gridGroup = cp5.addGroup("Grid Controls")
+  Group gridGroup = cp5.addGroup("Grid Controls (A0)")
     .setPosition(20, yPos)  
     .setWidth(groupWidth)
     .setBackgroundHeight(400)
@@ -248,8 +231,8 @@ void setupStripControlGroup(float yPos) {
   // Adjusted width to fit within narrower window with 5px margin
   int groupWidth = (windowWidth - 40) / 2 - 10;
   
-  // Create a group for strip controls - matching screenshot style
-  Group stripGroup = cp5.addGroup("Strip Controls")
+  // Create a group for strip controls (A1 + A2 share settings)
+  Group stripGroup = cp5.addGroup("Strip Controls (A1 + A2)")
     .setPosition(windowWidth/2, yPos)
     .setWidth(groupWidth) 
     .setBackgroundHeight(400)
@@ -300,32 +283,18 @@ void setupStripControlGroup(float yPos) {
     .setGroup(stripGroup)
     ;
   
-  // LED count input - style matching screenshot
-  cp5.addNumberbox("stripCount")
+  // Strip info label (replaces editable count control)
+  cp5.addTextlabel("stripInfo")
     .setPosition(controlHalfWidth + 40, wheelSize + 45)
-    .setSize(controlHalfWidth, 20)
-    .setRange(1, 300)
-    .setValue(stripCount)
-    .setMultiplier(1)
-    .setDirection(Controller.HORIZONTAL)
-    .setLabel("NUMBER OF LEDS")
-    .setColorBackground(color(0, 45, 90))
-    .setColorForeground(color(0, 55, 100))
-    .setColorActive(color(0, 65, 120))
-    .setColorLabel(color(0))
-    .setColorValue(color(255))
+    .setFont(createFont("Arial Bold", 12))
+    .setText("A1: " + strip1Count + "px  A2: " + strip2Count + "px")
+    .setColorValue(color(80))
     .setGroup(stripGroup)
     ;
-    
-  // Move label BELOW the control (changed from top)
-  Numberbox countBox = (Numberbox)cp5.getController("stripCount");
-  countBox.getCaptionLabel()
-        .align(ControlP5.LEFT, ControlP5.BOTTOM_OUTSIDE)
-        .setPaddingY(5);
   
   // Speed slider - style matching screenshot
   cp5.addSlider("stripSpeed")
-    .setPosition(controlHalfWidth + 40, wheelSize + 85)
+    .setPosition(controlHalfWidth + 40, wheelSize + 75)
     .setSize(controlHalfWidth, 20)
     .setRange(0.1, 10)
     .setValue(1.0)
@@ -338,7 +307,7 @@ void setupStripControlGroup(float yPos) {
     .setGroup(stripGroup)
     ;
     
-  // Move label BELOW the slider (changed from top)  
+  // Move label BELOW the slider  
   Slider stripSpeedSlider = (Slider)cp5.getController("stripSpeed");
   stripSpeedSlider.getCaptionLabel()
                 .align(ControlP5.LEFT, ControlP5.BOTTOM_OUTSIDE)
@@ -346,7 +315,7 @@ void setupStripControlGroup(float yPos) {
   
   // Playback mode dropdown - style matching screenshot
   cp5.addScrollableList("stripPlayback")
-    .setPosition(controlHalfWidth + 40, wheelSize + 125)
+    .setPosition(controlHalfWidth + 40, wheelSize + 115)
     .setSize(controlHalfWidth, 100)
     .setBarHeight(20)
     .setItemHeight(20)

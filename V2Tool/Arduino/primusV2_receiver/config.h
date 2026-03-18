@@ -23,8 +23,8 @@
 // =====================================================================
 enum OutputType {
   OUTPUT_OFF         = 0,  // Port disabled
-  OUTPUT_SHORT_STRIP = 1,  // 33-pixel RGB strip
-  OUTPUT_LONG_STRIP  = 2,  // 72-pixel RGBW strip
+  OUTPUT_SHORT_STRIP = 1,  // 68-pixel RGB strip
+  OUTPUT_LONG_STRIP  = 2,  // 72-pixel RGB strip
   OUTPUT_GRID        = 3   // 4×8 (32-pixel) RGB grid
 };
 
@@ -35,7 +35,7 @@ enum ColorOrder {
 
 // Human-readable names (for TFT / Serial)
 const char* outputTypeNames[] = { "Off", "Short Strip", "Long Strip", "Grid 4x8" };
-const uint16_t outputTypePixels[] = { 0, 33, 72, 32 };
+const uint16_t outputTypePixels[] = { 0, 68, 72, 32 };
 
 // =====================================================================
 //  Per-Output Configuration
@@ -63,20 +63,20 @@ inline void loadDefaultConfig(OutputConfig outputs[NUM_OUTPUTS]) {
   outputs[0].bytesPerPixel = 3;
   outputs[0].universe      = 0;
 
-  // Output 1 — Short strip, 33 RGB LEDs
+  // Output 1 — Short strip, 68 RGB LEDs
   outputs[1].type          = OUTPUT_SHORT_STRIP;
   outputs[1].colorOrder    = COLOR_RGB;
   outputs[1].pxl8Port      = 1;
-  outputs[1].pixelCount    = 33;
+  outputs[1].pixelCount    = 68;
   outputs[1].bytesPerPixel = 3;
   outputs[1].universe      = 1;
 
-  // Output 2 — Long strip, 72 RGBW LEDs
+  // Output 2 — Long strip, 72 RGB LEDs
   outputs[2].type          = OUTPUT_LONG_STRIP;
-  outputs[2].colorOrder    = COLOR_RGBW;
+  outputs[2].colorOrder    = COLOR_RGB;
   outputs[2].pxl8Port      = 2;
   outputs[2].pixelCount    = 72;
-  outputs[2].bytesPerPixel = 4;
+  outputs[2].bytesPerPixel = 3;
   outputs[2].universe      = 2;
 }
 

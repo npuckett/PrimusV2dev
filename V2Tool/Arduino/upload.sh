@@ -14,7 +14,6 @@ BAUD=921600
 
 # Required libraries (exact names from Arduino Library Manager)
 REQUIRED_LIBS=(
-  "ArtnetWifi"
   "Adafruit NeoPXL8"
   "Adafruit ST7735 and ST7789 Library"
   "Adafruit GFX Library"
