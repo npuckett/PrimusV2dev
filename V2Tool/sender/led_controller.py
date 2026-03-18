@@ -2,12 +2,17 @@
 """
 led_controller.py - Web-based GUI LED controller for PrimusV2 LED system.
 
-Controls NeoPixel strips via Art-Net over WiFi. Each strip has independent
-effect, color, speed, and playback controls. Supports multiple devices.
+Controls NeoPixel strips over WiFi using either raw UDP or Art-Net.
+Each strip has independent effect, color, speed, and playback controls.
+Supports multiple devices.
 
 Runs a local web server and opens the control interface in your browser.
 
-Edit the DEVICES list below to configure your hardware setup.
+Edit the DEVICES list and PROTOCOL variable below to configure your setup.
+
+Transport options (set PROTOCOL below):
+    "udp"    — PrimusV2 raw UDP: single packet, lowest latency (default)
+    "artnet" — Art-Net ArtDmx:  standard format, all strips in one packet
 
 Usage:
     python3 led_controller.py
@@ -21,6 +26,7 @@ import json
 import math
 import random
 import socket
+import struct
 import threading
 import time
 import webbrowser
@@ -63,6 +69,11 @@ EFFECT_NAMES = ["none", "solid", "pulse", "linear",
                 "constrainbow", "rainbow", "wipe"]
 PLAYBACK_MODES = ["loop", "boomerang", "once"]
 
+# Transport protocol.  Change to "artnet" to use standard Art-Net format.
+#   "udp"    — PrimusV2 raw UDP (fastest; custom magic "PV2" header)
+#   "artnet" — Art-Net ArtDmx  (standard; all strips in one universe-0 packet)
+PROTOCOL = "udp"
+
 
 # ======================================================================
 #  RAW UDP TRANSPORT — single packet per frame, all strips combined
@@ -103,6 +114,90 @@ class UDPSender:
         pkt += rgb_data
         self.sock.sendto(bytes(pkt), (self.ip, UDP_PORT))
         self.sequence = (self.sequence + 1) & 0xFF
+
+    def blackout(self, total_pixels):
+        if not self.connected:
+            return
+        self.send_frame(bytes(total_pixels * 3))
+
+
+# ======================================================================
+#  ART-NET TRANSPORT — standard Art-Net ArtDmx, single packet per frame
+# ======================================================================
+
+# Art-Net ArtDmx packet layout (Art-Net 4 spec):
+#   ID[8]:        "Art-Net\0"
+#   OpCode[2]:    0x00 0x50  (ArtDmx, little-endian)
+#   ProtVerHi[1]: 0
+#   ProtVerLo[1]: 14
+#   Sequence[1]:  1-255 rolling counter (0 disables sequencing)
+#   Physical[1]:  0
+#   SubUni[1]:    universe low byte  (0)
+#   Net[1]:       universe net byte  (0)
+#   LengthHi[1]:  data length MSB
+#   Length[1]:    data length LSB
+#   Data[n]:      RGB pixel data for all strips concatenated
+#
+# All strips are packed into a single universe-0 packet.  The standard
+# Art-Net limit is 512 bytes per universe; the PrimusV2 receiver accepts
+# the slightly larger payload (up to MAX_UDP_PACKET bytes) needed to hold
+# all LED data in one shot.
+
+ARTNET_HEADER  = b"Art-Net\x00"
+ARTNET_OPCODE_DMX = 0x5000   # ArtDmx opcode (sent little-endian)
+ARTNET_VERSION = 14
+ARTNET_PORT    = 6454
+
+
+class ArtNetSender:
+    """Sends one Art-Net ArtDmx packet per frame with all strips combined.
+
+    All strip RGB data is concatenated into a single universe-0 packet,
+    giving a standard Art-Net wire format that any Art-Net tool can see
+    while still delivering the full frame in one UDP datagram.
+    """
+
+    def __init__(self, ip):
+        self.ip = ip
+        self.sock = None
+        self.connected = False
+        self.sequence = 1   # Art-Net spec: 1-255 (0 = sequencing disabled)
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.connected = True
+
+    def disconnect(self):
+        self.connected = False
+        if self.sock:
+            self.sock.close()
+            self.sock = None
+
+    def _build_packet(self, rgb_data):
+        """Build an Art-Net ArtDmx packet containing all strip data."""
+        # Art-Net spec requires even length; pad if necessary
+        if len(rgb_data) % 2 != 0:
+            rgb_data = rgb_data + b'\x00'
+        length = len(rgb_data)
+        pkt = bytearray()
+        pkt += ARTNET_HEADER                               # ID[8]
+        pkt += struct.pack("<H", ARTNET_OPCODE_DMX)        # OpCode (LE)
+        pkt += struct.pack(">H", ARTNET_VERSION)           # ProtVer (BE)
+        pkt += bytes([self.sequence])                      # Sequence
+        pkt += bytes([0])                                  # Physical
+        pkt += struct.pack("<H", 0)                        # Universe 0 (LE)
+        pkt += struct.pack(">H", length)                   # Length (BE)
+        pkt += rgb_data                                    # Data
+        return bytes(pkt)
+
+    def send_frame(self, rgb_data):
+        """Send a single Art-Net frame with all strips' RGB data."""
+        if not self.connected or not self.sock:
+            return
+        pkt = self._build_packet(rgb_data)
+        self.sock.sendto(pkt, (self.ip, ARTNET_PORT))
+        # Sequence counter: 1-255, wrapping back to 1 (never 0)
+        self.sequence = (self.sequence % 255) + 1
 
     def blackout(self, total_pixels):
         if not self.connected:
@@ -288,7 +383,7 @@ EFFECTS = {
 # ======================================================================
 
 class ControllerState:
-    """Holds all settings, computes animations, sends UDP."""
+    """Holds all settings, computes animations, sends frames."""
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -298,12 +393,19 @@ class ControllerState:
         self.last_tick = self.start_time
         self.devices = []
 
+        sender_cls = {"udp": UDPSender, "artnet": ArtNetSender}.get(PROTOCOL)
+        if sender_cls is None:
+            raise ValueError(
+                f"Unknown PROTOCOL {PROTOCOL!r}. "
+                "Valid options are 'udp' (raw PrimusV2) or 'artnet' (Art-Net ArtDmx)."
+            )
+
         for dev_cfg in DEVICES:
             dev = {
                 "name": dev_cfg["name"],
                 "ip": dev_cfg["ip"],
                 "connected": False,
-                "sender": UDPSender(dev_cfg["ip"]),
+                "sender": sender_cls(dev_cfg["ip"]),
                 "strips": [],
             }
             for s_cfg in dev_cfg["strips"]:

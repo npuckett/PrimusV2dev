@@ -50,12 +50,16 @@ int8_t pxl8Pins[8] = {
 // NeoPXL8 LED driver — initialized in setup after config is loaded
 Adafruit_NeoPXL8* leds = nullptr;
 
-// Raw UDP
+// Raw UDP / Art-Net — both use port 6454
 #define UDP_PORT 6454
+// PrimusV2 raw UDP magic header bytes
 #define UDP_MAGIC_0 'P'
 #define UDP_MAGIC_1 'V'
 #define UDP_MAGIC_2 '2'
-#define MAX_UDP_PACKET 600  // 4 header + 516 data max
+// Buffer large enough for:
+//   Raw UDP:  4 header + 516 pixel data   = 520 bytes
+//   Art-Net:  18 header + 516 pixel data  = 534 bytes
+#define MAX_UDP_PACKET 600
 WiFiUDP udp;
 uint8_t udpBuf[MAX_UDP_PACKET];
 
@@ -202,6 +206,74 @@ void processRawPacket(uint8_t* data, uint16_t len) {
     memcpy(outputBuffers[o], pixelData + offset, stripBytes);
     outputDataReady[o] = true;
     outputActive[o] = true;
+    outputLastPacket[o] = now;
+
+    offset += stripBytes;
+  }
+
+  newDataSinceLastShow = true;
+}
+
+// =====================================================================
+//  Art-Net ArtDmx Packet Handler (combined single-universe mode)
+// =====================================================================
+//
+// Accepts an Art-Net ArtDmx packet whose data field carries all strips
+// concatenated into universe 0 — exactly as sent by ArtNetSender in
+// led_controller.py.  The packet header layout is:
+//   Bytes  0-7 : "Art-Net\0" magic
+//   Bytes  8-9 : OpCode 0x00 0x50 (ArtDmx, little-endian)
+//   Bytes 10-11: ProtVer 0x00 0x0E (big-endian = 14)
+//   Byte  12   : Sequence
+//   Byte  13   : Physical
+//   Bytes 14-15: Universe (little-endian, expected 0)
+//   Bytes 16-17: Data length (big-endian)
+//   Bytes 18+  : Concatenated RGB pixel data (all strips in config order)
+
+#define ARTNET_HEADER_LEN  8   // "Art-Net\0"
+#define ARTNET_DATA_OFFSET 18  // bytes before pixel data starts
+#define ARTNET_OPCODE_DMX  0x5000  // ArtDmx opcode (compared after LE → uint16)
+
+static const uint8_t ARTNET_MAGIC[ARTNET_HEADER_LEN] =
+  { 'A', 'r', 't', '-', 'N', 'e', 't', '\0' };
+
+void processArtNetPacket(uint8_t* data, uint16_t len) {
+  // Must be long enough to hold the full header
+  if (len < ARTNET_DATA_OFFSET) return;
+
+  // Verify Art-Net magic
+  if (memcmp(data, ARTNET_MAGIC, ARTNET_HEADER_LEN) != 0) return;
+
+  // Verify ArtDmx opcode (little-endian at bytes 8-9)
+  uint16_t opcode = (uint16_t)data[8] | ((uint16_t)data[9] << 8);
+  if (opcode != ARTNET_OPCODE_DMX) return;
+
+  // Extract data length (big-endian at bytes 16-17)
+  uint16_t dataLen = ((uint16_t)data[16] << 8) | data[17];
+  // Clamp to actual received bytes
+  if ((uint16_t)(ARTNET_DATA_OFFSET + dataLen) > len) {
+    dataLen = len - ARTNET_DATA_OFFSET;
+  }
+
+  uint8_t* pixelData = data + ARTNET_DATA_OFFSET;
+
+  unsigned long now = millis();
+  packetCount++;
+
+  // Distribute concatenated pixel data to output buffers (same as raw UDP)
+  uint16_t offset = 0;
+  for (uint8_t o = 0; o < NUM_OUTPUTS; o++) {
+    if (outputs[o].type == OUTPUT_OFF) continue;
+
+    uint16_t pixelCount = outputs[o].pixelCount;
+    uint8_t  bpp        = outputs[o].bytesPerPixel;
+    uint16_t stripBytes = pixelCount * bpp;
+
+    if (offset + stripBytes > dataLen) break;  // Not enough data
+
+    memcpy(outputBuffers[o], pixelData + offset, stripBytes);
+    outputDataReady[o] = true;
+    outputActive[o]    = true;
     outputLastPacket[o] = now;
 
     offset += stripBytes;
@@ -472,10 +544,11 @@ void setup() {
     displayError("WiFi Fail", "Could not connect. Retrying...");
   }
 
-  // Init raw UDP listener
+  // Init UDP listener (accepts both PrimusV2 raw UDP and Art-Net packets)
   udp.begin(UDP_PORT);
-  Serial.print("Raw UDP listening on port ");
-  Serial.println(UDP_PORT);
+  Serial.print("UDP listening on port ");
+  Serial.print(UDP_PORT);
+  Serial.println(" (PrimusV2 raw + Art-Net combined)");
 
   // Init timing
   lastFpsTime = millis();
@@ -529,7 +602,15 @@ void loop() {
     }
     int bytesRead = udp.read(udpBuf, pktSize);
     if (bytesRead > 0) {
-      processRawPacket(udpBuf, bytesRead);
+      // Auto-detect packet type by magic header
+      if (bytesRead >= 3 &&
+          udpBuf[0] == UDP_MAGIC_0 &&
+          udpBuf[1] == UDP_MAGIC_1 &&
+          udpBuf[2] == UDP_MAGIC_2) {
+        processRawPacket(udpBuf, bytesRead);
+      } else {
+        processArtNetPacket(udpBuf, bytesRead);
+      }
     }
   }
 
