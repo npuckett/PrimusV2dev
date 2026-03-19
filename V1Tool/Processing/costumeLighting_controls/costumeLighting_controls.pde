@@ -2,27 +2,25 @@
  * LED Costume Controller - Processing Control Interface
  * ------------------------------------------
  * 
- * This code provides a graphical interface to control two NeoPixel LED strips via Art-Net:
- * 1. A badge (8x4 grid, 32 LEDs)
- * 2. A collar (30 LEDs by default, configurable)
+ * This code provides a graphical interface to control three NeoPixel
+ * outputs via Art-Net, matching the PrimusV2 hardware:
+ *   Strip A0: 8×4 grid, 32 LEDs  (universe 0)
+ *   Strip A1: 68 LEDs             (universe 1)
+ *   Strip A2: 72 LEDs             (universe 2)
  * 
  * The interface allows for:
- * - Setting colors and animations for both LED sets independently
+ * - Setting colors and animations for all LED outputs independently
  * - Adjusting brightness, speed, and animation parameters
  * - Connecting to ESP32 devices over WiFi using Art-Net protocol
  * 
  * Hardware Requirements:
  * - Computer running Processing
- * - ESP32 device running the companion receiver sketch
+ * - ESP32-S3 Reverse TFT Feather + NeoPXL8 Friend running primusV2_receiver
  * - WiFi network connecting both devices
  * 
  * Libraries Required:
  * - ControlP5: https://github.com/sojamo/controlp5
  * - ArtnetP5: https://github.com/rstephan/ArtnetP5
- * 
- * Settings to Change:
- * - Default device IP address if needed
- * - Default LED counts and effects if desired
  * 
  */
 
@@ -32,7 +30,8 @@ import ch.bildspur.artnet.*;
 // Global variables
 ControlP5 cp5;
 Grid ledGrid;
-Strip ledStrip;
+Strip ledStrip1;  // A1: 68 LEDs (universe 1)
+Strip ledStrip2;  // A2: 72 LEDs (universe 2)
 boolean initialized = false;
 
 // Animation timer to track elapsed time for animations
@@ -54,8 +53,9 @@ color stripEndColor = #0000FF;   // Default blue
 float gridSpeed = 1.0;
 float stripSpeed = 0.5;
 
-// Strip LED count
-int stripCount = 30;
+// Strip LED counts (matching hardwareTest.ino)
+int strip1Count = 68;  // A1
+int strip2Count = 72;  // A2
 
 // Linear fade angle for grid
 float gridLinearAngle = 0;
@@ -63,10 +63,8 @@ float gridLinearAngle = 0;
 // ArtNet settings
 ArtNetDevice artnetDevice;
 String deviceIP = "192.168.1.100";  // Default IP address from the Arduino code
-int universe = 0;                    // Default universe (hardcoded now)
 boolean artNetEnabled = true;        // Enable/disable ArtNet sending
 boolean isConnected = false;         // Track connection status
-boolean useV2Protocol = false;       // false = V1 single universe, true = V2 multi-universe
 
 // LED Brightness (0-255)
 int ledBrightness = 50;  // Default value matching Arduino code
@@ -78,18 +76,21 @@ int frameInterval = 1000/targetFPS;  // Frame interval in milliseconds
 
 // Window dimensions
 int windowWidth = 1080;    // Window width
-int windowHeight = 1000;   // Window height
+int windowHeight = 1200;   // Window height
 
 void setup() {
-  size(1080, 1100);  // Window size
+  size(1080, 1200);  // Window size
   background(245);
   
   // Initialize UI
   cp5 = new ControlP5(this);
   
-  // Initialize LEDs - Grid must be initialized before Strip
+  // Initialize LEDs — Grid (A0) must be initialized before Strips
   ledGrid = new Grid(8, 4);
-  ledStrip = new Strip(stripCount);
+  float strip1Y = ledGrid.yPos + ledGrid.height + 40;
+  ledStrip1 = new Strip(strip1Count, strip1Y, "A1");
+  float strip2Y = strip1Y + ledStrip1.getHeight() + 30;
+  ledStrip2 = new Strip(strip2Count, strip2Y, "A2");
   
   // Initialize UI controls - must be after LED initialization
   setupControls();
@@ -100,11 +101,12 @@ void setup() {
   // Initialize animation timer
   startTime = millis();
   
-  // Initialize ArtNet device (badge = 32 LEDs, collar = 30 LEDs by default)
+  // Initialize ArtNet device (3 outputs: A0=32, A1=68, A2=72)
   if (artNetEnabled) {
     try {
-      artnetDevice = new ArtNetDevice(universe, deviceIP, 32 + stripCount, useV2Protocol);
-      println("ArtNet initialized: " + deviceIP + " on universe " + universe);
+      int[] ledCounts = {32, strip1Count, strip2Count};
+      artnetDevice = new ArtNetDevice(deviceIP, ledCounts);
+      println("ArtNet initialized: " + deviceIP + " on universes 0,1,2");
       isConnected = true;
       updateStatusLabel();
     } catch (Exception e) {
@@ -139,15 +141,17 @@ void draw() {
     updateColorsFromWheels();
     
     ledGrid.update();
-    ledStrip.update();
+    ledStrip1.update();
+    ledStrip2.update();
     
-    // Draw the LED grid and strip
+    // Draw the LED grid and strips
     ledGrid.display();
-    ledStrip.display();
+    ledStrip1.display();
+    ledStrip2.display();
     
-    // Send the LED data via ArtNet
+    // Send the LED data via ArtNet (3 universes)
     if (artNetEnabled && artnetDevice != null && isConnected) {
-      artnetDevice.updateData(ledGrid.leds, ledStrip.leds, ledBrightness);
+      artnetDevice.updateData(ledGrid.leds, ledStrip1.leds, ledStrip2.leds, ledBrightness);
       artnetDevice.sendData();
     }
   }
@@ -157,7 +161,8 @@ void draw() {
 void resetAnimations() {
   startTime = millis();
   ledGrid.resetColors();
-  ledStrip.resetColors();
+  ledStrip1.resetColors();
+  ledStrip2.resetColors();
 }
 
 // Update color values from ColorWheel components
@@ -218,15 +223,6 @@ void controlEvent(ControlEvent event) {
     stripPlayback = cp5.get(ScrollableList.class, "stripPlayback").getItem((int)event.getValue()).get("name").toString();
     resetAnimations();
   }
-  // Strip count changed
-  else if (name.equals("stripCount")) {
-    stripCount = int(event.getController().getValue());
-    ledStrip = new Strip(stripCount);
-    // Recreate ArtNet device with new LED count
-    if (artNetEnabled && isConnected) {
-      connectArtNet();
-    }
-  }
   // Grid speed changed
   else if (name.equals("gridSpeed")) {
     gridSpeed = event.getController().getValue();
@@ -260,16 +256,6 @@ void controlEvent(ControlEvent event) {
   else if (name.equals("ledBrightness")) {
     ledBrightness = int(event.getController().getValue());
   }
-  // Device profile changed (V1 legacy vs V2 multi-universe)
-  else if (name.equals("deviceProfile")) {
-    int profileIdx = int(event.getController().getValue());
-    useV2Protocol = (profileIdx == 1);
-    println("Device profile → " + (useV2Protocol ? "V2 Multi-Universe" : "V1 Legacy"));
-    // Reconnect with new protocol if currently connected
-    if (artNetEnabled && isConnected) {
-      connectArtNet();
-    }
-  }
 }
 
 // ArtNet connection methods
@@ -284,8 +270,9 @@ void connectArtNet() {
   }
   
   try {
-    // Create ArtNet device — V2 mode sends grid/strip on separate universes
-    artnetDevice = new ArtNetDevice(0, deviceIP, 32 + stripCount, useV2Protocol);
+    // Create ArtNet device — 3 outputs on separate universes
+    int[] ledCounts = {32, strip1Count, strip2Count};
+    artnetDevice = new ArtNetDevice(deviceIP, ledCounts);
     artNetEnabled = true;
     isConnected = true;
     updateStatusLabel();

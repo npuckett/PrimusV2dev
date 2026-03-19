@@ -9,8 +9,8 @@
 
 // WiFi network credentials
 // Change these to match your WiFi network
-const char* WIFI_SSID = "myHomeNetwork";           // The name of your WiFi network
-const char* WIFI_PASSWORD = "blinkylights";        // Your WiFi password
+const char* WIFI_SSID = "NETGEAR44";           // The name of your WiFi network
+const char* WIFI_PASSWORD = "sweetgadfly251";        // Your WiFi password
 
 // Fixed IP address configuration
 // Change these if they conflict with your network setup

@@ -1,10 +1,11 @@
-// Class to manage the LED strip
+// Class to manage an LED strip
 
 class Strip {
   int count;
   LED[] leds;
   float ledSize = 20; // Keep original LED size
   float spacing = 5;  // Keep original spacing
+  String label;       // Display label (e.g. "A0", "A1", "A2")
   
   // Position of the strip on screen
   float xPos = 50;
@@ -12,10 +13,14 @@ class Strip {
   float width;
   
   Strip(int count) {
+    this(count, ledGrid.yPos + ledGrid.height + 30, "");
+  }
+  
+  Strip(int count, float startY, String label) {
     this.count = count;
+    this.label = label;
     
-    // Set yPos based on grid position (to be below grid)
-    yPos = ledGrid.yPos + ledGrid.height + 30;
+    yPos = startY;
     
     // Calculate total width needed for all LEDs
     float totalWidth = (ledSize + spacing) * count;
@@ -44,6 +49,12 @@ class Strip {
     width = Math.min(totalWidth, maxLedsPerRow * (ledSize + spacing));
   }
   
+  float getHeight() {
+    int maxLedsPerRow = (int) Math.floor((windowWidth - 100) / (ledSize + spacing));
+    int rowCount = (int) Math.ceil((float)count / maxLedsPerRow);
+    return rowCount * (ledSize + spacing) + 10;
+  }
+  
   void display() {
     // Calculate how many rows we need
     int maxLedsPerRow = (int) Math.floor((windowWidth - 100) / (ledSize + spacing));
@@ -55,6 +66,14 @@ class Strip {
     // Container for the entire strip
     float containerHeight = rowCount * (ledSize + spacing) + 10;
     rect(xPos - 10, yPos - 10, width + 20, containerHeight, 8);
+    
+    // Draw label if set
+    if (label != null && !label.isEmpty()) {
+      fill(100);
+      textSize(11);
+      textAlign(LEFT, TOP);
+      text(label + " (" + count + "px)", xPos - 5, yPos - 25);
+    }
     
     // Draw LEDs
     for (int i = 0; i < count; i++) {

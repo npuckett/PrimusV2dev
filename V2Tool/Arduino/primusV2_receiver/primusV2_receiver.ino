@@ -1,18 +1,18 @@
 /*
- * primusV2_receiver.ino — PrimusV2 ArtNet LED Receiver
- * =====================================================
- * Receives Art-Net data over WiFi and drives up to 3 NeoPixel outputs
- * via the NeoPXL8 hardware buffer on an ESP32-S3 Reverse TFT Feather.
+ * primusV2_receiver.ino — PrimusV2 Raw UDP LED Receiver
+ * ======================================================
+ * Receives a single raw UDP packet per frame containing all strip
+ * data and drives up to 3 NeoPixel outputs via the NeoPXL8 hardware
+ * buffer on an ESP32-S3 Reverse TFT Feather.
  *
- * Each output maps to its own ArtNet universe:
- *   Universe 0 → Output 0 (NeoPXL8 port 0)
- *   Universe 1 → Output 1 (NeoPXL8 port 1)
- *   Universe 2 → Output 2 (NeoPXL8 port 2)
- *
- * Per-universe byte layout:
- *   [brightness] [R G B (W)] [R G B (W)] ...
- *   First byte = brightness (0-255), rest = pixel data.
- *   3 bytes/pixel for RGB, 4 bytes/pixel for RGBW.
+ * Packet format (from sender):
+ *   Bytes 0-2: "PV2" magic header
+ *   Byte 3:    sequence number
+ *   Bytes 4+:  RGB data, all strips concatenated in config order
+ *              Strip 0: 32px × 3 = 96 bytes
+ *              Strip 1: 68px × 3 = 204 bytes
+ *              Strip 2: 72px × 3 = 216 bytes
+ *              Total: 520 bytes per packet
  *
  * Hardware:
  *   - Adafruit ESP32-S3 Reverse TFT Feather
@@ -20,7 +20,6 @@
  *   - Up to 3 NeoPixel strips/grids
  *
  * Libraries Required:
- *   - ArtnetWifi   https://github.com/rstephan/ArtnetWifi
  *   - Adafruit_NeoPXL8
  *   - Adafruit_ST7789 + Adafruit_GFX  (for TFT)
  *
@@ -28,7 +27,7 @@
  */
 
 #include <WiFi.h>
-#include <ArtnetWifi.h>
+#include <WiFiUdp.h>
 #include <Adafruit_NeoPXL8.h>
 
 #include "config.h"
@@ -51,8 +50,18 @@ int8_t pxl8Pins[8] = {
 // NeoPXL8 LED driver — initialized in setup after config is loaded
 Adafruit_NeoPXL8* leds = nullptr;
 
-// ArtNet
-ArtnetWifi artnet;
+// Raw UDP / Art-Net — both use port 6454
+#define UDP_PORT 6454
+// PrimusV2 raw UDP magic header bytes
+#define UDP_MAGIC_0 'P'
+#define UDP_MAGIC_1 'V'
+#define UDP_MAGIC_2 '2'
+// Buffer large enough for:
+//   Raw UDP:  4 header + 516 pixel data   = 520 bytes
+//   Art-Net:  18 header + 516 pixel data  = 534 bytes
+#define MAX_UDP_PACKET 600
+WiFiUDP udp;
+uint8_t udpBuf[MAX_UDP_PACKET];
 
 // Per-output data buffers (max possible: 72 pixels × 4 bytes RGBW = 288 bytes)
 #define MAX_BUFFER_SIZE (MAX_LEDS_PER_PORT * 4)
@@ -61,23 +70,22 @@ bool    outputDataReady[NUM_OUTPUTS]  = { false, false, false };
 bool    outputActive[NUM_OUTPUTS]     = { false, false, false };
 unsigned long outputLastPacket[NUM_OUTPUTS] = { 0, 0, 0 };
 
-// Brightness
-int currentBrightness = DEFAULT_BRIGHTNESS;
-bool brightnessChanged = false;
-
-// Last-color tracking for change detection (per pixel, per output)
-uint32_t lastColors[NUM_OUTPUTS][MAX_LEDS_PER_PORT];
+// Brightness — fixed at 255 (sender sends raw RGB values).
+// D2 button cycles brightness only in local test mode.
+int currentBrightness = 255;
 
 // WiFi state
 bool wifiConnected = false;
 unsigned long lastReconnectAttempt = 0;
 
 // Timing
-unsigned long lastLEDUpdateTime = 0;
+unsigned long lastShowTime = 0;
+#define SHOW_INTERVAL 16  // ~60 FPS max show rate
 unsigned long lastFpsTime = 0;
 unsigned long frameCount = 0;
 unsigned long packetCount = 0;
 float currentFps = 0;
+bool newDataSinceLastShow = false;
 
 // Test mode
 bool testModeActive = false;
@@ -158,8 +166,8 @@ void checkWifiConnection() {
         lastReconnectAttempt = now;
         wifiConnected = connectWifi();
         if (wifiConnected) {
-          artnet.begin();
-          Serial.println("ArtNet reinitialized after reconnection.");
+          udp.begin(UDP_PORT);
+          Serial.println("UDP reinitialized after reconnection.");
         }
       }
     }
@@ -167,63 +175,120 @@ void checkWifiConnection() {
 }
 
 // =====================================================================
-//  ArtNet Callback
+//  Raw UDP Packet Handler
 // =====================================================================
 
-void onDmxFrame(uint16_t universe, uint16_t length, uint8_t sequence, uint8_t* data) {
+void processRawPacket(uint8_t* data, uint16_t len) {
+  // Validate magic header: "PV2" at bytes 0-2
+  if (len < 4) return;
+  if (data[0] != UDP_MAGIC_0 || data[1] != UDP_MAGIC_1 || data[2] != UDP_MAGIC_2) return;
+
+  // Byte 3 = sequence (informational)
+  // Bytes 4+ = concatenated RGB data for all strips in config order
+  uint16_t dataLen = len - 4;
+  uint8_t* pixelData = data + 4;
+
   unsigned long now = millis();
   packetCount++;
 
-  // Find which output this universe belongs to
-  int outputIdx = -1;
-  for (uint8_t i = 0; i < NUM_OUTPUTS; i++) {
-    if (outputs[i].universe == universe && outputs[i].type != OUTPUT_OFF) {
-      outputIdx = i;
-      break;
-    }
-  }
-  if (outputIdx < 0) return; // Unknown universe, ignore
+  // Walk through outputs, slicing the concatenated data by pixel count
+  uint16_t offset = 0;
+  for (uint8_t o = 0; o < NUM_OUTPUTS; o++) {
+    if (outputs[o].type == OUTPUT_OFF) continue;
 
-  // Rate limiting
-  if (now - lastLEDUpdateTime < MIN_UPDATE_INTERVAL) return;
+    uint16_t pixelCount = outputs[o].pixelCount;
+    uint8_t  bpp        = outputs[o].bytesPerPixel;
+    uint16_t stripBytes = pixelCount * bpp;
 
-  if (length == 0) return;
+    if (offset + stripBytes > dataLen) break;  // Not enough data
 
-  outputLastPacket[outputIdx] = now;
-  outputActive[outputIdx] = true;
+    // Copy into output buffer
+    memcpy(outputBuffers[o], pixelData + offset, stripBytes);
+    outputDataReady[o] = true;
+    outputActive[o] = true;
+    outputLastPacket[o] = now;
 
-  // First byte = brightness
-  int newBrightness = data[0];
-  if (abs(newBrightness - currentBrightness) > BRIGHTNESS_THRESHOLD) {
-    currentBrightness = newBrightness;
-    brightnessChanged = true;
+    offset += stripBytes;
   }
 
-  // Copy pixel data into output buffer
-  uint16_t pixelCount = outputs[outputIdx].pixelCount;
-  uint8_t  bpp        = outputs[outputIdx].bytesPerPixel;
-  uint16_t maxBytes   = min((uint16_t)(length - 1), (uint16_t)(pixelCount * bpp));
+  newDataSinceLastShow = true;
+}
 
-  for (uint16_t i = 0; i < maxBytes; i++) {
-    outputBuffers[outputIdx][i] = data[1 + i];
+// =====================================================================
+//  Art-Net ArtDmx Packet Handler (combined single-universe mode)
+// =====================================================================
+//
+// Accepts an Art-Net ArtDmx packet whose data field carries all strips
+// concatenated into universe 0 — exactly as sent by ArtNetSender in
+// led_controller.py.  The packet header layout is:
+//   Bytes  0-7 : "Art-Net\0" magic
+//   Bytes  8-9 : OpCode 0x00 0x50 (ArtDmx, little-endian)
+//   Bytes 10-11: ProtVer 0x00 0x0E (big-endian = 14)
+//   Byte  12   : Sequence
+//   Byte  13   : Physical
+//   Bytes 14-15: Universe (little-endian, expected 0)
+//   Bytes 16-17: Data length (big-endian)
+//   Bytes 18+  : Concatenated RGB pixel data (all strips in config order)
+
+#define ARTNET_HEADER_LEN  8   // "Art-Net\0"
+#define ARTNET_DATA_OFFSET 18  // bytes before pixel data starts
+#define ARTNET_OPCODE_DMX  0x5000  // ArtDmx opcode (compared after LE → uint16)
+
+static const uint8_t ARTNET_MAGIC[ARTNET_HEADER_LEN] =
+  { 'A', 'r', 't', '-', 'N', 'e', 't', '\0' };
+
+void processArtNetPacket(uint8_t* data, uint16_t len) {
+  // Must be long enough to hold the full header
+  if (len < ARTNET_DATA_OFFSET) return;
+
+  // Verify Art-Net magic
+  if (memcmp(data, ARTNET_MAGIC, ARTNET_HEADER_LEN) != 0) return;
+
+  // Verify ArtDmx opcode (little-endian at bytes 8-9)
+  uint16_t opcode = (uint16_t)data[8] | ((uint16_t)data[9] << 8);
+  if (opcode != ARTNET_OPCODE_DMX) return;
+
+  // Extract data length (big-endian at bytes 16-17)
+  uint16_t dataLen = ((uint16_t)data[16] << 8) | data[17];
+  // Clamp to actual received bytes
+  if ((uint16_t)(ARTNET_DATA_OFFSET + dataLen) > len) {
+    dataLen = len - ARTNET_DATA_OFFSET;
   }
 
-  outputDataReady[outputIdx] = true;
-  lastLEDUpdateTime = now;
+  uint8_t* pixelData = data + ARTNET_DATA_OFFSET;
+
+  unsigned long now = millis();
+  packetCount++;
+
+  // Distribute concatenated pixel data to output buffers (same as raw UDP)
+  uint16_t offset = 0;
+  for (uint8_t o = 0; o < NUM_OUTPUTS; o++) {
+    if (outputs[o].type == OUTPUT_OFF) continue;
+
+    uint16_t pixelCount = outputs[o].pixelCount;
+    uint8_t  bpp        = outputs[o].bytesPerPixel;
+    uint16_t stripBytes = pixelCount * bpp;
+
+    if (offset + stripBytes > dataLen) break;  // Not enough data
+
+    memcpy(outputBuffers[o], pixelData + offset, stripBytes);
+    outputDataReady[o] = true;
+    outputActive[o]    = true;
+    outputLastPacket[o] = now;
+
+    offset += stripBytes;
+  }
+
+  newDataSinceLastShow = true;
 }
 
 // =====================================================================
 //  LED Update — apply buffered data to NeoPXL8
 // =====================================================================
 
-void updateLEDs() {
-  if (brightnessChanged) {
-    leds->setBrightness(currentBrightness);
-    brightnessChanged = false;
-  }
-
-  bool anyUpdate = false;
-
+void applyBufferedData() {
+  // Apply any pending output buffers to the NeoPXL8 pixel array.
+  // Does NOT call show() — that happens on a fixed timer in loop().
   for (uint8_t o = 0; o < NUM_OUTPUTS; o++) {
     if (!outputDataReady[o]) continue;
 
@@ -232,40 +297,25 @@ void updateLEDs() {
     uint8_t  bpp   = outputs[o].bytesPerPixel;
 
     for (uint16_t p = 0; p < count; p++) {
-      uint32_t newColor;
       uint16_t base = p * bpp;
 
       if (bpp == 4) {
-        // RGBW
-        newColor = Adafruit_NeoPixel::Color(
+        setStripPixel(port, p, Adafruit_NeoPixel::Color(
           outputBuffers[o][base],
           outputBuffers[o][base + 1],
           outputBuffers[o][base + 2],
           outputBuffers[o][base + 3]
-        );
+        ));
       } else {
-        // RGB
-        newColor = Adafruit_NeoPixel::Color(
+        setStripPixel(port, p, Adafruit_NeoPixel::Color(
           outputBuffers[o][base],
           outputBuffers[o][base + 1],
           outputBuffers[o][base + 2]
-        );
-      }
-
-      // Change detection — only update if color differs
-      if (newColor != lastColors[o][p]) {
-        setStripPixel(port, p, newColor);
-        lastColors[o][p] = newColor;
-        anyUpdate = true;
+        ));
       }
     }
 
     outputDataReady[o] = false;
-  }
-
-  if (anyUpdate) {
-    leds->show();
-    frameCount++;
   }
 }
 
@@ -391,9 +441,12 @@ void handleTestToggle() {
 }
 
 void handleBrightnessCycle() {
+  // Only affects local test mode — remote mode uses raw RGB values
   brightPresetIndex = (brightPresetIndex + 1) % NUM_BRIGHTNESS_PRESETS;
   currentBrightness = brightnessPresets[brightPresetIndex];
-  leds->setBrightness(currentBrightness);
+  if (testModeActive) {
+    leds->setBrightness(currentBrightness);
+  }
   Serial.print("Brightness → ");
   Serial.print(brightnessPresetNames[brightPresetIndex]);
   Serial.print(" (");
@@ -476,13 +529,10 @@ void setup() {
     while (1) { delay(100); }
   }
 
-  leds->setBrightness(currentBrightness);
+  leds->setBrightness(255);  // Always full — sender pre-multiplies brightness
   leds->fill(0);
   leds->show();
   Serial.println("NeoPXL8 initialized OK");
-
-  // Clear last-color tracking
-  memset(lastColors, 0, sizeof(lastColors));
 
   // Connect WiFi
   Serial.println("Connecting to WiFi...");
@@ -494,14 +544,15 @@ void setup() {
     displayError("WiFi Fail", "Could not connect. Retrying...");
   }
 
-  // Init ArtNet
-  artnet.begin();
-  artnet.setArtDmxCallback(onDmxFrame);
-  Serial.println("ArtNet listening");
+  // Init UDP listener (accepts both PrimusV2 raw UDP and Art-Net packets)
+  udp.begin(UDP_PORT);
+  Serial.print("UDP listening on port ");
+  Serial.print(UDP_PORT);
+  Serial.println(" (PrimusV2 raw + Art-Net combined)");
 
   // Init timing
   lastFpsTime = millis();
-  lastLEDUpdateTime = millis();
+  lastShowTime = millis();
 
   Serial.println("Setup complete. Buttons: D0=Screen D1=Test D2=Brightness");
   Serial.println();
@@ -532,18 +583,47 @@ void loop() {
   }
 
   if (testModeActive) {
-    // In test mode — run local animations, skip ArtNet processing
+    // In test mode — run local animations, skip UDP processing
     runTestAnimations();
     delay(33); // ~30fps
     return;
   }
 
-  // Normal operation — process ArtNet
+  // Normal operation — process raw UDP
   checkWifiConnection();
-  artnet.read();
 
-  // Apply received LED data
-  updateLEDs();
+  // Drain ALL pending UDP packets
+  int pktSize;
+  while ((pktSize = udp.parsePacket()) > 0) {
+    if (pktSize > MAX_UDP_PACKET) {
+      // Too large — flush it
+      while (udp.available()) udp.read();
+      continue;
+    }
+    int bytesRead = udp.read(udpBuf, pktSize);
+    if (bytesRead > 0) {
+      // Auto-detect packet type by magic header
+      if (bytesRead >= 3 &&
+          udpBuf[0] == UDP_MAGIC_0 &&
+          udpBuf[1] == UDP_MAGIC_1 &&
+          udpBuf[2] == UDP_MAGIC_2) {
+        processRawPacket(udpBuf, bytesRead);
+      } else {
+        processArtNetPacket(udpBuf, bytesRead);
+      }
+    }
+  }
+
+  // Apply any received data to the pixel buffer
+  applyBufferedData();
+
+  // Fixed-rate show — pushes pixels at a steady rate, never mid-frame
+  if (newDataSinceLastShow && (now - lastShowTime >= SHOW_INTERVAL)) {
+    leds->show();
+    lastShowTime = now;
+    newDataSinceLastShow = false;
+    frameCount++;
+  }
 
   // Check for idle outputs
   checkOutputTimeouts();
@@ -563,6 +643,20 @@ void loop() {
     Serial.print(WiFi.RSSI());
     Serial.print("dBm, Bright: ");
     Serial.println(currentBrightness);
+
+    // Debug: print first pixel of each active output
+    for (uint8_t o = 0; o < NUM_OUTPUTS; o++) {
+      if (outputActive[o] && outputs[o].pixelCount > 0) {
+        Serial.print("  Out");
+        Serial.print(o);
+        Serial.print(" px0: R=");
+        Serial.print(outputBuffers[o][0]);
+        Serial.print(" G=");
+        Serial.print(outputBuffers[o][1]);
+        Serial.print(" B=");
+        Serial.println(outputBuffers[o][2]);
+      }
+    }
 
     // Update TFT footer if on status screen
     displayUpdateFooter(currentFps, currentBrightness);
