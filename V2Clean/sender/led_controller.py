@@ -155,8 +155,25 @@ class ArtNetSender:
 #  ART-NET DISCOVERY — ArtPoll broadcast
 # ======================================================================
 
+def _get_subnet_broadcast():
+    """Derive the subnet broadcast address from the host's local IP."""
+    try:
+        # Connect trick to find the local IP on the LAN
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+        # Assume /24 — replace last octet with 255
+        parts = local_ip.split(".")
+        parts[3] = "255"
+        return ".".join(parts)
+    except Exception:
+        return None
+
+
 def discover_artnet_nodes(timeout=2.0):
-    """Broadcast ArtPoll and collect ArtPollReply responses.
+    """Send ArtPoll via broadcast, subnet broadcast, and unicast to known
+    devices.  Collect ArtPollReply responses.
 
     Returns a list of dicts:
       {"ip", "short_name", "long_name", "num_ports", "universes": [int,...]}
@@ -166,7 +183,7 @@ def discover_artnet_nodes(timeout=2.0):
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.settimeout(0.25)
     # Bind to Art-Net port so we receive replies (nodes reply to port 6454)
-    sock.bind(('', ARTNET_PORT))
+    sock.bind(("", ARTNET_PORT))
 
     # Build ArtPoll packet (14 bytes)
     poll = bytearray()
@@ -175,7 +192,18 @@ def discover_artnet_nodes(timeout=2.0):
     poll += struct.pack(">H", ARTNET_VERSION)
     poll += bytes([0x00, 0x00])  # TalkToMe, Priority
 
-    sock.sendto(bytes(poll), ("255.255.255.255", ARTNET_PORT))
+    # Send to multiple destinations for maximum reach:
+    #  1) limited broadcast  (may be blocked by routers / macOS firewall)
+    #  2) subnet broadcast   (usually works on local LAN)
+    #  3) unicast to every configured device IP (guaranteed delivery)
+    targets = {"255.255.255.255"}
+    subnet_bc = _get_subnet_broadcast()
+    if subnet_bc:
+        targets.add(subnet_bc)
+    for dev in DEVICES:
+        targets.add(dev["ip"])
+    for dest in targets:
+        sock.sendto(bytes(poll), (dest, ARTNET_PORT))
 
     nodes = {}
     deadline = time.monotonic() + timeout
