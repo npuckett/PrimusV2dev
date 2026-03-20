@@ -154,6 +154,7 @@ inline uint8_t countActiveOutputs(const OutputConfig outputs[NUM_OUTPUTS]) {
 #define ARTNET_OPCODE_DMX      0x5000
 #define ARTNET_OPCODE_POLL     0x2000
 #define ARTNET_OPCODE_POLLREPLY 0x2100
+#define ARTNET_OPCODE_ADDRESS  0x6000
 #define ARTNET_PROTOCOL_VER    14
 
 // Device identity — reported in ArtPollReply

@@ -16,6 +16,7 @@
 
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <Preferences.h>
 #include <Adafruit_NeoPXL8.h>
 
 #include "config.h"
@@ -70,6 +71,11 @@ unsigned long lastReconnectAttempt = 0;
 // ── Sender address (for FPS back-channel) ────────────────────────────
 IPAddress senderIP;
 bool      senderKnown = false;
+
+// ── Custom device name (stored in NVS via ArtAddress) ────────────────
+Preferences prefs;
+char customShortName[18] = {0};
+bool hasCustomName = false;
 
 // ── Timing / FPS ─────────────────────────────────────────────────────
 unsigned long lastShowTime  = 0;
@@ -207,7 +213,8 @@ void sendArtPollReply(IPAddress dest) {
   reply[25] = (ESTA_CODE >> 8) & 0xFF;
 
   // Short Name (bytes 26-43, max 18 chars)
-  strncpy((char*)&reply[26], DEVICE_SHORT_NAME, 17);
+  const char* nameToUse = hasCustomName ? customShortName : DEVICE_SHORT_NAME;
+  strncpy((char*)&reply[26], nameToUse, 17);
 
   // Long Name (bytes 44-107, max 64 chars)
   // Build dynamically: "PrimusV2 LED Node | A0:Short Strip A1:Long Strip ..."
@@ -295,6 +302,32 @@ void broadcastArtPollReply() {
 }
 
 // =====================================================================
+//  Art-Net ArtAddress — remote naming (opcode 0x6000)
+// =====================================================================
+
+void handleArtAddress(uint8_t* data, uint16_t len) {
+  if (len < 107) return;
+
+  // Short name at bytes 14-31 (18 chars, null-terminated)
+  char newName[18] = {0};
+  memcpy(newName, data + 14, 17);
+  newName[17] = '\0';
+
+  if (newName[0] != '\0') {
+    strncpy(customShortName, newName, 17);
+    customShortName[17] = '\0';
+    hasCustomName = true;
+    prefs.putString("shortName", customShortName);
+    Serial.print("ArtAddress: name set to \"");
+    Serial.print(customShortName);
+    Serial.println("\"");
+  }
+
+  // Respond with ArtPollReply per spec
+  broadcastArtPollReply();
+}
+
+// =====================================================================
 //  Art-Net Packet Router — branch on opcode
 // =====================================================================
 
@@ -310,6 +343,12 @@ void processArtNetPacket(uint8_t* data, uint16_t len, IPAddress remoteAddr) {
   if (opcode == ARTNET_OPCODE_POLL) {
     // ArtPoll — respond with ArtPollReply
     sendArtPollReply(remoteAddr);
+    return;
+  }
+
+  if (opcode == ARTNET_OPCODE_ADDRESS) {
+    // ArtAddress — remote naming
+    handleArtAddress(data, len);
     return;
   }
 
@@ -596,6 +635,18 @@ void setup() {
   Serial.println("NeoPXL8 OK — brightness locked to 255");
 
   // Connect WiFi
+  prefs.begin("artnet", false);
+  if (prefs.isKey("shortName")) {
+    String stored = prefs.getString("shortName", "");
+    if (stored.length() > 0) {
+      stored.toCharArray(customShortName, sizeof(customShortName));
+      hasCustomName = true;
+      Serial.print("Loaded custom name: \"");
+      Serial.print(customShortName);
+      Serial.println("\"");
+    }
+  }
+
   wifiConnected = connectWifi();
   if (wifiConnected) {
     displayConnection(DEFAULT_WIFI_SSID, WiFi.localIP(), true, WiFi.RSSI());

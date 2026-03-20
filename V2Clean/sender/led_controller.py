@@ -18,6 +18,7 @@ No external dependencies — uses only Python standard library.
 import argparse
 import json
 import math
+import re
 import random
 import socket
 import struct
@@ -238,6 +239,64 @@ def discover_artnet_nodes(timeout=2.0):
 
     sock.close()
     return list(nodes.values())
+
+
+# ======================================================================
+#  NODE OUTPUT PARSING — derive config from ArtPollReply
+# ======================================================================
+
+def _match_output_type(display_name):
+    """Match an Arduino display name (e.g. 'Short Strip') to an OUTPUT_TYPES key."""
+    key = display_name.strip().lower().replace(" ", "_")
+    if key in OUTPUT_TYPES:
+        return key
+    for type_key in OUTPUT_TYPES:
+        if key.startswith(type_key):
+            return type_key
+    return None
+
+
+def _parse_node_outputs(long_name, universes):
+    """Parse ArtPollReply long_name to extract output configuration.
+
+    Expected format: 'PrimusV2 LED Node | A0:Short Strip A1:Long Strip ...'
+    Falls back to generic long_strip outputs if parsing fails.
+    """
+    outputs = []
+    parts = long_name.split("|")
+    if len(parts) >= 2:
+        matches = re.findall(r'(A\d+):([^A]+?)(?=\s+A\d+:|$)', parts[1])
+        for name, type_display in matches:
+            type_key = _match_output_type(type_display)
+            if type_key:
+                outputs.append({"name": name, "type": type_key})
+    if not outputs:
+        for i in range(len(universes)):
+            outputs.append({"name": "A{}".format(i), "type": "long_strip"})
+    return outputs
+
+
+# ======================================================================
+#  ART-NET NAMING — ArtAddress (opcode 0x6000)
+# ======================================================================
+
+def send_art_address(ip, short_name):
+    """Send ArtAddress packet to set a node's short name."""
+    pkt = bytearray(107)
+    pkt[0:8] = ARTNET_HEADER
+    struct.pack_into("<H", pkt, 8, 0x6000)
+    struct.pack_into(">H", pkt, 10, ARTNET_VERSION)
+    pkt[12] = 0x7F  # NetSwitch: no change
+    pkt[13] = 0     # BindIndex
+    name_bytes = short_name.encode("ascii", errors="replace")[:17]
+    pkt[14:14 + len(name_bytes)] = name_bytes
+    for i in range(96, 104):
+        pkt[i] = 0x7F  # SwIn/SwOut: no change
+    pkt[104] = 0x7F  # SubSwitch: no change
+    pkt[106] = 0x00  # Command: AcNone
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.sendto(bytes(pkt), (ip, ARTNET_PORT))
+    sock.close()
 
 
 # ======================================================================
@@ -595,6 +654,69 @@ class ControllerState:
             dev["sender"].disconnect()
             dev["connected"] = False
 
+    def add_device_from_node(self, node_info):
+        """Add a device from ArtPoll discovery data. Returns status dict."""
+        with self.lock:
+            for dev in self.devices:
+                if dev["ip"] == node_info["ip"]:
+                    return {"status": "exists"}
+
+            output_cfgs = _parse_node_outputs(
+                node_info.get("long_name", ""),
+                node_info.get("universes", []))
+            base_u = node_info["universes"][0] if node_info.get("universes") else 0
+
+            dev = {
+                "name": node_info.get("short_name", "Node"),
+                "ip": node_info["ip"],
+                "base_universe": base_u,
+                "connected": False,
+                "sender": ArtNetSender(node_info["ip"]),
+                "outputs": [],
+            }
+            for idx, o_cfg in enumerate(output_cfgs):
+                resolved = _resolve_output(o_cfg)
+                universe = (node_info["universes"][idx]
+                            if idx < len(node_info.get("universes", []))
+                            else base_u + idx)
+                dev["outputs"].append({
+                    **resolved,
+                    "universe": universe,
+                    "effect": DEFAULT_EFFECT,
+                    "start_color": list(DEFAULT_START_COLOR),
+                    "end_color": list(DEFAULT_END_COLOR),
+                    "speed": DEFAULT_SPEED,
+                    "playback": DEFAULT_PLAYBACK,
+                    "angle": 0,
+                    "led_state": [],
+                    "pixels": [],
+                })
+            self.devices.append(dev)
+            return {"status": "added", "device_index": len(self.devices) - 1}
+
+    def remove_device(self, di):
+        """Remove a device by index."""
+        with self.lock:
+            if 0 <= di < len(self.devices):
+                dev = self.devices[di]
+                if dev["sender"].connected:
+                    info = [(o["universe"], o["count"]) for o in dev["outputs"]]
+                    dev["sender"].blackout(info)
+                    dev["sender"].disconnect()
+                self.devices.pop(di)
+                return True
+        return False
+
+    def rename_device(self, di, new_name):
+        """Rename a device locally and send ArtAddress to the node."""
+        with self.lock:
+            if 0 <= di < len(self.devices):
+                dev = self.devices[di]
+                send_art_address(dev["ip"], new_name)
+                dev["name"] = new_name
+                return True
+        return False
+
     def tick(self):
         """Compute one frame and send per-universe Art-Net packets."""
         now = time.monotonic()
@@ -728,11 +850,22 @@ canvas{display:block;margin:0 auto 12px;border-radius:6px;background:#0f172a}
 .scan-bar button{background:#0d9488;font-size:14px;padding:8px 16px}
 .scan-bar button:hover{background:#14b8a6}
 .scan-bar .scan-status{font-size:13px;color:#9ca3af}
-.node-list{display:flex;gap:8px;flex-wrap:wrap}
-.node-chip{background:#1f2937;border:1px solid #4b5563;border-radius:6px;
-  padding:6px 12px;font-size:13px;color:#e5e7eb;cursor:default}
-.node-chip .nn{color:#a5b4fc;font-weight:600}
-.node-chip .ni{color:#9ca3af;font-size:12px}
+.node-list{display:flex;flex-direction:column;gap:8px;margin-bottom:16px}
+.node-card{background:#1f2937;border:1px solid #4b5563;border-radius:8px;
+  padding:12px 16px;display:flex;align-items:center;justify-content:space-between;gap:12px}
+.node-card:hover{border-color:#6366f1}
+.node-info{flex:1}.node-title{margin-bottom:4px}
+.node-title .nn{color:#a5b4fc;font-weight:600;font-size:15px}
+.node-title .ni{color:#9ca3af;font-size:13px;margin-left:8px}
+.node-detail{font-size:12px;color:#6b7280}
+.node-actions{display:flex;gap:6px;align-items:center}
+.node-badge{font-size:12px;padding:4px 10px;border-radius:4px;font-weight:500}
+.node-badge.connected{background:#065f4620;color:#34d399;border:1px solid #34d39944}
+.scan-empty{color:#6b7280;font-size:13px;padding:12px;text-align:center}
+button.small{font-size:12px;padding:5px 10px}
+.dev-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.dev-header h2{margin:0}
+.dev-actions{display:flex;gap:6px}
 </style>
 </head>
 <body>
@@ -795,7 +928,11 @@ function buildUI() {
       ? '<span class="rx-fps" id="rxfps-' + di + '">RX: ' + dev.receiver_fps + ' fps</span>'
       : '<span class="rx-fps" id="rxfps-' + di + '"></span>';
 
-    var html = '<h2>' + esc(dev.name) + '</h2>'
+    var html = '<div class="dev-header"><h2>' + esc(dev.name) + '</h2>'
+      + '<div class="dev-actions">'
+      + '<button class="small" onclick="doRename(' + di + ')">Rename</button>'
+      + '<button class="small danger" onclick="doRemove(' + di + ')">Remove</button>'
+      + '</div></div>'
       + '<div class="net-row">'
       + '<label>IP:</label>'
       + '<input type="text" id="ip-' + di + '" value="' + esc(dev.ip) + '" class="' + cclass + '"'
@@ -863,6 +1000,13 @@ function buildUI() {
       oc.appendChild(p);
     });
   });
+
+  if (S.devices.length === 0) {
+    var emptyMsg = document.createElement("div");
+    emptyMsg.style.cssText = "text-align:center;padding:32px;color:#6b7280;font-size:14px";
+    emptyMsg.innerHTML = 'No devices configured. Use <b>Scan Network</b> above to discover and add Art-Net nodes.';
+    app.appendChild(emptyMsg);
+  }
 
   // Global controls
   var dbg = document.createElement("div");
@@ -941,25 +1085,71 @@ function drawPreview() {
   });
 }
 
+var _discoveredNodes = [];
+
 function doScan() {
   var st = document.getElementById("scan-status");
   var nl = document.getElementById("node-list");
   st.textContent = "Scanning...";
   nl.innerHTML = "";
+  _discoveredNodes = [];
   apiPost("/api/discover", {}).then(function(r) { return r.json(); })
     .then(function(nodes) {
+      _discoveredNodes = nodes;
       st.textContent = nodes.length + " node(s) found";
-      nodes.forEach(function(n) {
-        var chip = document.createElement("div");
-        chip.className = "node-chip";
-        chip.innerHTML = '<span class="nn">' + esc(n.short_name) + '</span> '
-          + '<span class="ni">' + esc(n.ip) + ' &middot; '
-          + n.num_ports + ' port(s) &middot; U'
-          + n.universes.join(",") + '</span>';
-        nl.appendChild(chip);
+      if (nodes.length === 0) {
+        nl.innerHTML = '<div class="scan-empty">No Art-Net nodes found. Make sure devices are powered on and connected to WiFi.</div>';
+        return;
+      }
+      nodes.forEach(function(n, ni) {
+        var card = document.createElement("div");
+        card.className = "node-card";
+        var already = S && S.devices.some(function(d) { return d.ip === n.ip; });
+        var badge = already
+          ? '<span class="node-badge connected">Connected</span>'
+          : '<button class="small" onclick="doAddNode(' + ni + ')">Add</button>';
+        var details = n.long_name.split("|");
+        var outputInfo = details.length > 1 ? details[1].trim() : "";
+        card.innerHTML = '<div class="node-info">'
+          + '<div class="node-title"><span class="nn">' + esc(n.short_name) + '</span>'
+          + ' <span class="ni">' + esc(n.ip) + '</span></div>'
+          + '<div class="node-detail">' + n.num_ports + ' output(s) &middot; Universe '
+          + n.universes.join(", ") + (outputInfo ? ' &middot; ' + esc(outputInfo) : '') + '</div>'
+          + '</div>'
+          + '<div class="node-actions">' + badge + '</div>';
+        nl.appendChild(card);
       });
     })
     .catch(function() { st.textContent = "Scan failed"; });
+}
+
+function doAddNode(ni) {
+  var n = _discoveredNodes[ni];
+  if (!n) return;
+  apiPost("/api/add_discovered", n)
+    .then(function(r) { return r.json(); })
+    .then(function() {
+      fetchState().then(function() { buildUI(); drawPreview(); doScan(); });
+    });
+}
+
+function doRename(di) {
+  var current = S.devices[di] ? S.devices[di].name : "";
+  var name = prompt("Enter new name for this device:", current);
+  if (name !== null && name.trim() !== "") {
+    apiPost("/api/rename_node", {device: di, name: name.trim()})
+      .then(function() { return fetchState(); })
+      .then(function() { buildUI(); drawPreview(); });
+  }
+}
+
+function doRemove(di) {
+  var name = S.devices[di] ? S.devices[di].name : "this device";
+  if (confirm("Remove " + name + "?")) {
+    apiPost("/api/remove_device", {device: di})
+      .then(function() { return fetchState(); })
+      .then(function() { buildUI(); drawPreview(); });
+  }
 }
 
 function doConnect(di) {
@@ -1052,6 +1242,21 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps(nodes, separators=(",", ":")).encode()
             self._respond(200, "application/json", body)
             return
+        elif self.path == "/api/add_discovered":
+            result = self.controller.add_device_from_node(data)
+            if result.get("status") == "added":
+                self.controller.connect(result["device_index"])
+            body = json.dumps(result, separators=(",", ":")).encode()
+            self._respond(200, "application/json", body)
+            return
+        elif self.path == "/api/remove_device":
+            di = data.get("device", -1)
+            self.controller.remove_device(di)
+        elif self.path == "/api/rename_node":
+            di = data.get("device", -1)
+            new_name = str(data.get("name", ""))[:17]
+            if new_name:
+                self.controller.rename_device(di, new_name)
 
         self._respond(200, "application/json", b'{"ok":true}')
 
